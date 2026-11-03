@@ -11,9 +11,29 @@ const crypto = require('crypto');
 const router = express.Router();
 
 // 客户端领取页地址（导出卡密时拼接）
-const CLAIM_PAGE_URL = process.env.CLAIM_PAGE_URL || 'http://localhost:3000/claim';
+// 导出/复制的领取链接: 按请求的协议+主机名动态生成, 指向客户端端口 3010
+// (可用环境变量 CLAIM_PAGE_URL 完全覆盖, 如绑定了独立域名)
+const claimPageUrl = (req) =>
+  process.env.CLAIM_PAGE_URL ||
+  `${req.protocol}://${req.hostname}:${process.env.CLIENT_PORT || 3010}/claim`;
 
 // ==================== 管理员修改自己的密码 ====================
+// 协议执行日志 (管理端自查看)
+const CLAIM_API_LOG = process.env.CLAIM_API_URL || 'http://127.0.0.1:8899';
+router.get('/logs', adminAuthMiddleware, async (req, res) => {
+  const lines = parseInt(req.query.lines, 10) || 300;
+  try {
+    const r = await fetch(`${CLAIM_API_LOG}/api/v1/logs?lines=${lines}`,
+                          { signal: AbortSignal.timeout(5000) });
+    res.json(await r.json());
+  } catch (e) {
+    res.json({ ok: false, lines: ['协议层不可达: ' + e.message] });
+  }
+});
+router.get('/logs/view', adminAuthMiddleware, (req, res) => {
+  res.sendFile(require('path').join(__dirname, '../public/logs.html'));
+});
+
 router.post('/change-password', adminAuthMiddleware, (req, res) => {
   const { old_password, new_password } = req.body || {};
   if (!old_password || !new_password) {
@@ -125,7 +145,7 @@ router.get('/cards/export', adminAuthMiddleware, (req, res) => {
   const rows = cards.map(c => ({
     'ID': c.id,
     '卡密': c.card_key,
-    '领取链接': `${CLAIM_PAGE_URL}?kami=${encodeURIComponent(c.card_key)}`,
+    '领取链接': `${claimPageUrl(req)}?kami=${encodeURIComponent(c.card_key)}`,
     '状态': c.status === 1 ? '已使用' : '未使用',
     '备注': c.note || '',
     '所属代理': c.agent_name || '平台自营',
@@ -295,124 +315,133 @@ router.delete('/agents/:id', adminAuthMiddleware, (req, res) => {
   res.json({ ok: true });
 });
 
-// ==================== 设备池（多用户并发会话）====================
-// 代理 claim-api 的会话/预热接口，给管理端做可视化。
-// 背景：每个用户走一台独立设备（这是能不能触发会员的关键），
-//       预热池 = 提前把设备归因好放着，用户来直接拿现成的，不用等 ~15 秒。
-const CLAIM_API = process.env.CLAIM_API_URL || 'http://127.0.0.1:8888';
-
-async function claimApi(path, options = {}) {
-  const res = await fetch(`${CLAIM_API}${path}`, {
-    ...options,
-    headers: { 'Content-Type': 'application/json', ...(options.headers || {}) },
-    signal: AbortSignal.timeout(15000),
+// ==================== 系统设置 (代理IP / 打码Token) ====================
+// 配置存 settings 表; claim-api 每次领取时实时读取 (改完即时生效, 无需重启)
+router.get('/settings', adminAuthMiddleware, (req, res) => {
+  const rows = db.prepare("SELECT key, value FROM settings").all();
+  const s = {};
+  rows.forEach(r => { s[r.key] = r.value; });
+  res.json({
+    proxy_extract_url: s.proxy_extract_url || '',
+    jfbym_token: s.jfbym_token || '',
+    proxy_enabled: s.proxy_enabled !== '0',
+    proxy_keepalive: parseInt(s.proxy_keepalive || '0', 10) || 0,
+    proxy_ttl: parseInt(s.proxy_ttl || '0', 10) || 0,
   });
-  return res.json();
-}
+});
 
-/** 手机号脱敏：管理端也不该直接看到完整号码 */
-function maskKey(k) {
-  if (k === '__default__') return '（系统默认设备）';
-  if (/^\d{11}$/.test(k)) return `${k.slice(0, 3)}****${k.slice(-4)}`;
-  return k;
-}
+router.post('/settings', adminAuthMiddleware, (req, res) => {
+  const { proxy_extract_url, jfbym_token, proxy_enabled, proxy_keepalive, proxy_ttl } = req.body || {};
+  const up = db.prepare(
+    "INSERT INTO settings (key, value) VALUES (?, ?) " +
+    "ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = datetime('now','localtime')");
+  const tx = db.transaction(() => {
+    if (proxy_extract_url !== undefined) up.run('proxy_extract_url', String(proxy_extract_url || '').trim());
+    if (jfbym_token !== undefined) up.run('jfbym_token', String(jfbym_token || '').trim());
+    if (proxy_enabled !== undefined) up.run('proxy_enabled', proxy_enabled ? '1' : '0');
+    if (proxy_keepalive !== undefined) up.run('proxy_keepalive', String(Math.max(0, parseInt(proxy_keepalive, 10) || 0)));
+    if (proxy_ttl !== undefined) up.run('proxy_ttl', String(Math.max(0, parseInt(proxy_ttl, 10) || 0)));
+  });
+  tx();
+  res.json({ ok: true });
+});
 
-// 设备来源（管理端「来源」列）：
-//   warm      预热池里还没被用掉的（现成可用）
-//   from_warm 从预热池分配给某个手机号的
-//   new       用户首次来时现场新建的（没走预热，慢 ~15 秒）
-//   default   系统默认设备（/health、/accounts 用）
-const SOURCE_LABEL = {
-  warm: '预热池·待分配',
-  from_warm: '预热池·已分配',
-  new: '现场新建',
-  default: '系统默认'
-};
-
-/** 设备池状态：预热就绪数 / 目标数 / 活跃会话列表 */
-router.get('/pool', adminAuthMiddleware, async (req, res) => {
+// 测试代理提取链接 (拉一条线路验证)
+router.post('/settings/test-proxy', adminAuthMiddleware, async (req, res) => {
+  const url = (req.body && req.body.proxy_extract_url) ||
+    db.prepare("SELECT value FROM settings WHERE key = 'proxy_extract_url'").get()?.value;
+  if (!url) return res.json({ ok: false, msg: '未配置提取链接' });
   try {
-    const [sess, health] = await Promise.all([
-      claimApi('/api/v1/sessions'),
-      claimApi('/health')
-    ]);
-    res.json({
-      success: true,
-      warm_ready: sess.warm_ready ?? 0,
-      warm_target: sess.warm_target ?? 0,
-      warm_interval: sess.warm_interval ?? 0,
-      warm_refill: sess.warm_refill !== false,
-      warm_consumed: sess.warm_consumed ?? 0,
-      released: sess.released ?? 0,
-      sessions: sess.sessions ?? 0,
-      max_sessions: sess.max_sessions ?? 0,
-      claim_api_ok: !!health.ok,
-      pc_version: health.pc_version || '',
-      host_preset: health.host_preset || '',
-      // 活跃设备（预热池待分配 + 处理中）+ **使用台账**（用完的设备，标"已使用 + 结果"）
-      // 用户要的就是这个形态：设备用完不消失，那一行留在列表里并标上成功/失败和手机号
-      items: [
-        ...(sess.items || []).map((it) => ({
-          ...it,
-          state: it.busy ? 'busy' : 'idle',
-          key: it.source === 'warm' ? '（预热池待分配）' : maskKey(String(it.key ?? '')),
-          source_label: SOURCE_LABEL[it.source] || it.source || '-'
-        })),
-        ...(sess.used_items || []).map((u) => ({
-          key: maskKey(String(u.phone ?? '')),
-          kami: u.kami || '',
-          state: 'used',
-          result: u.result,
-          dir: u.dir || '',
-          source: u.from_warm ? 'from_warm' : 'new',
-          source_label: u.from_warm ? '预热池·已使用' : '现场新建·已使用',
-          attributed: true,
-          busy: false,
-          in_use: 0,
-          last_used: u.finished_at || 0
-        }))
-      ]
-    });
+    const r = await fetch(url, { signal: AbortSignal.timeout(20000) });
+    const text = await r.text();
+    let line = '';
+    if (text.trim().startsWith('{')) {
+      const d = JSON.parse(text);
+      const it = (d.data || [])[0] || {};
+      line = it.proxy_ip ? `${it.proxy_ip}:${it.proxy_port}` : '';
+    } else {
+      line = (text.split('\n').find(l => l.trim()) || '').trim();
+    }
+    if (!line) return res.json({ ok: false, msg: '提取返回为空: ' + text.slice(0, 80) });
+    res.json({ ok: true, msg: '提取成功: ' + line.split(':').slice(0, 2).join(':') });
   } catch (e) {
-    res.json({ success: false, msg: `算法服务不可达：${e.message}`, items: [] });
+    res.json({ ok: false, msg: '提取失败: ' + e.message });
   }
 });
 
-/** 设置预热池：挂几台备用设备 + 补池限速（每台之间隔多少秒） */
-router.post('/pool/warm', adminAuthMiddleware, async (req, res) => {
-  const target = Number(req.body && req.body.target);
-  if (!Number.isInteger(target) || target < 0 || target > 50) {
-    return res.status(400).json({ success: false, msg: '台数需为 0~50 的整数' });
-  }
-  const payload = { target };
-  // 间隔是可选项：不传就不改（避免只想改台数时把限速重置了）
-  if (req.body && req.body.interval !== undefined && req.body.interval !== null) {
-    const iv = Number(req.body.interval);
-    if (!Number.isFinite(iv) || iv < 0 || iv > 3600) {
-      return res.status(400).json({ success: false, msg: '间隔需为 0~3600 秒' });
-    }
-    payload.interval = iv;
-  }
-  // 是否"用完自动补充"（不传就不改）
-  if (req.body && typeof req.body.refill === 'boolean') {
-    payload.refill = req.body.refill;
-  }
+// 测试打码 Token (查图鉴余额)
+router.post('/settings/test-captcha', adminAuthMiddleware, async (req, res) => {
+  const token = (req.body && req.body.jfbym_token) ||
+    db.prepare("SELECT value FROM settings WHERE key = 'jfbym_token'").get()?.value;
+  if (!token) return res.json({ ok: false, msg: '未配置打码Token' });
   try {
-    const r = await claimApi('/api/v1/warm', {
+    const r = await fetch('http://api.jfbym.com/api/YmServer/getUserInfoApi', {
       method: 'POST',
-      body: JSON.stringify(payload)
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token, type: 'score' }),
+      signal: AbortSignal.timeout(20000),
     });
-    res.json({
-      success: !!r.ok,
-      warm_target: r.warm_target,
-      warm_interval: r.warm_interval,
-      warm_refill: r.warm_refill,
-      warm_ready: r.warm_ready,
-      msg: r.msg || ''
-    });
+    const d = await r.json();
+    if (d.code === 10001 || d.data?.score !== undefined) {
+      return res.json({ ok: true, msg: `Token有效, 余额: ${d.data.score}` });
+    }
+    res.json({ ok: false, msg: d.msg || 'Token无效' });
   } catch (e) {
-    res.json({ success: false, msg: `算法服务不可达：${e.message}` });
+    res.json({ ok: false, msg: '查询失败: ' + e.message });
   }
+});
+
+// ==================== 兑换记录 (手机号/CK/到期/头像/用户名) ====================
+router.get('/claim-records', adminAuthMiddleware, (req, res) => {
+  const { page = 1, size = 20, phone = '', kami = '' } = req.query;
+  const where = [];
+  const args = [];
+  if (phone) { where.push('o.phone LIKE ?'); args.push(`%${phone}%`); }
+  if (kami) { where.push('c.card_key LIKE ?'); args.push(`%${kami}%`); }
+  const w = where.length ? 'WHERE ' + where.join(' AND ') : '';
+  const total = db.prepare(`SELECT COUNT(*) c FROM claim_orders o
+    LEFT JOIN cards c ON c.id = o.card_id ${w}`).get(...args).c;
+  const rows = db.prepare(`
+    SELECT o.id, o.phone, o.status, o.result, o.member_expire_at, o.avatar,
+           o.username, o.ck_before, o.ck_after, o.created_at, o.finished_at,
+           c.card_key, a.username AS agent_username
+    FROM claim_orders o
+    LEFT JOIN cards c ON c.id = o.card_id
+    LEFT JOIN agents a ON a.id = c.agent_id
+    ${w} ORDER BY o.id DESC LIMIT ? OFFSET ?`)
+    .all(...args, Number(size), (Number(page) - 1) * Number(size));
+  res.json({ total, rows });
+});
+
+router.get('/claim-records/export', adminAuthMiddleware, (req, res) => {
+  const { phone = '', kami = '' } = req.query;
+  const where = [];
+  const args = [];
+  if (phone) { where.push('o.phone LIKE ?'); args.push(`%${phone}%`); }
+  if (kami) { where.push('c.card_key LIKE ?'); args.push(`%${kami}%`); }
+  const w = where.length ? 'WHERE ' + where.join(' AND ') : '';
+  const rows = db.prepare(`
+    SELECT o.id, o.phone, c.card_key, a.username AS agent_username, o.username,
+           o.member_expire_at, o.status, o.result, o.ck_before, o.ck_after,
+           o.created_at, o.finished_at
+    FROM claim_orders o
+    LEFT JOIN cards c ON c.id = o.card_id
+    LEFT JOIN agents a ON a.id = c.agent_id
+    ${w} ORDER BY o.id DESC`).all(...args);
+  const data = rows.map(r => ({
+    'ID': r.id, '手机号': r.phone, '卡密': r.card_key, '代理': r.agent_username || '-',
+    '用户名': r.username || '-', '会员到期': r.member_expire_at || '-',
+    '状态': r.status, '结果': r.result || '',
+    '未转换CK': r.ck_before || '-', '转换后CK': r.ck_after || '-',
+    '创建时间': r.created_at, '完成时间': r.finished_at || '-',
+  }));
+  const ws = XLSX.utils.json_to_sheet(data);
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, '兑换记录');
+  const buf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
+  res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+  res.setHeader('Content-Disposition', 'attachment; filename=claim-records.xlsx');
+  res.send(buf);
 });
 
 module.exports = router;

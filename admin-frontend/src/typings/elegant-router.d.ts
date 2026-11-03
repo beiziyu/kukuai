@@ -28,7 +28,9 @@ declare module "@elegant-router/types" {
     "manage": "/manage";
     "manage_agents": "/manage/agents";
     "manage_cards": "/manage/cards";
-    "manage_pool": "/manage/pool";
+    "manage_ipset": "/manage/ipset";
+    "manage_logs": "/manage/logs";
+    "manage_records": "/manage/records";
   };
 
   /**
@@ -93,7 +95,9 @@ declare module "@elegant-router/types" {
     | "dashboard"
     | "manage_agents"
     | "manage_cards"
-    | "manage_pool"
+    | "manage_ipset"
+    | "manage_logs"
+    | "manage_records"
   >;
 
   /**

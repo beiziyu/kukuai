@@ -14,22 +14,40 @@ const DATA_APP = process.argv[3] ||
     'eyJhcHBfa2V5IjoiMTU0NTkiLCJhcHBfdmlldyI6InByb21vdGUiLCJicm93c2VyX3VybCI6Imh0dHBzOi8vc29maXJlLmJhaWR1LmNvbS9kYXRhL3VhL2FiLmpzb24iLCJmb3JtX2Rlc2MiOiIiLCJzZW5kX2ludGVydmFsIjo1MCwic2VuZF9tZXRob2QiOjN9';
 const PAGE_URL = 'https://kuku.baidu.com/operation/activitys/kukuPcSignAct/main?utm_source=home2';
 
+// ---------------------------------------------------------------- 代理支持
+// sofire 上报必须和领奖请求走【同一条 91 代理 IP】, 否则百度侧看到
+// "登录/领奖用代理IP、申请领奖凭证却用机房IP" 的自相矛盾。
+// 格式: http://user:pass@ip:port  →  CONNECT 隧道 + Proxy-Authorization: Basic
+// 由 Python 侧通过环境变量 HTJ_PROXY 传入 (本单锁定的那条 IP)。
+const PROXY_URL = process.env.HTJ_PROXY || '';
+let PROXY = null;
+if (PROXY_URL) {
+    try {
+        const pu = new URL(PROXY_URL);
+        PROXY = {
+            host: pu.hostname,
+            port: parseInt(pu.port || '80', 10),
+            auth: pu.username
+                ? decodeURIComponent(pu.username) + ':' + decodeURIComponent(pu.password)
+                : '',
+        };
+    } catch (e) {
+        console.error(JSON.stringify({ ok: false, stage: 'proxy-parse', error: String(e) }));
+        process.exit(1);
+    }
+}
+
 // ---------------------------------------------------------------- 网络层
 function realRequest(method, urlStr, headers, body, cb) {
     const u = new URL(urlStr);
     const mod = u.protocol === 'https:' ? https : http;
-    const opts = {
-        method, hostname: u.hostname, port: u.port || (u.protocol === 'https:' ? 443 : 80),
-        path: u.pathname + u.search,
-        headers: Object.assign({
-            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36',
-            'Accept-Language': 'zh-CN,zh;q=0.9',
-        }, headers),
-    };
-    if (u.username) {
-        opts.auth = decodeURIComponent(u.username) + ':' + decodeURIComponent(u.password);
-    }
-    const req = mod.request(opts, (res) => {
+    const baseHeaders = Object.assign({
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36',
+        'Accept-Language': 'zh-CN,zh;q=0.9',
+    }, headers);
+
+    // 响应处理 (代理与直连共用)
+    const handle = (res, socket) => {
         const chunks = [];
         let stream = res;
         const enc = (res.headers['content-encoding'] || '').toLowerCase();
@@ -45,11 +63,65 @@ function realRequest(method, urlStr, headers, body, cb) {
                 const eq = kv.indexOf('=');
                 if (eq > 0) COOKIE_STORE[kv.slice(0, eq)] = kv.slice(eq + 1);
             });
+            if (socket) { try { socket.destroy(); } catch (e) { /* ignore */ } }
             cb({ status: res.statusCode, responseText: text });
         });
-        stream.on('error', (e) => cb({ status: 0, responseText: '', error: String(e) }));
-    });
-    req.on('error', (e) => cb({ status: 0, responseText: '', error: String(e) }));
+        stream.on('error', (e) => {
+            if (socket) { try { socket.destroy(); } catch (e) { /* ignore */ } }
+            cb({ status: 0, responseText: '', error: String(e) });
+        });
+    };
+    const fail = (e) => cb({ status: 0, responseText: '', error: String(e) });
+
+    // ---- 走代理: CONNECT 隧道 (HTTP 代理访问 HTTPS 的标准方式) ----
+    if (PROXY) {
+        const target = `${u.hostname}:${u.port || (u.protocol === 'https:' ? 443 : 80)}`;
+        const tunnel = http.request({
+            host: PROXY.host,
+            port: PROXY.port,
+            method: 'CONNECT',
+            path: target,
+            headers: Object.assign({
+                Host: target,
+                'Proxy-Authorization': 'Basic ' + Buffer.from(PROXY.auth).toString('base64'),
+            }),
+        });
+        tunnel.on('connect', (res, socket) => {
+            if (res.statusCode !== 200) {
+                try { socket.destroy(); } catch (e) { /* ignore */ }
+                return fail(new Error('CONNECT 失败 status=' + res.statusCode));
+            }
+            const inner = mod.request({
+                socket, agent: false,
+                method,
+                hostname: u.hostname,
+                port: u.port || (u.protocol === 'https:' ? 443 : 80),
+                path: u.pathname + u.search,
+                headers: baseHeaders,
+            }, (r) => handle(r, socket));
+            inner.on('error', (e) => {
+                try { socket.destroy(); } catch (e) { /* ignore */ }
+                fail(e);
+            });
+            if (body) inner.write(body);
+            inner.end();
+        });
+        tunnel.on('error', fail);
+        tunnel.end();
+        return;
+    }
+
+    // ---- 直连 (原逻辑) ----
+    const opts = {
+        method, hostname: u.hostname, port: u.port || (u.protocol === 'https:' ? 443 : 80),
+        path: u.pathname + u.search,
+        headers: baseHeaders,
+    };
+    if (u.username) {
+        opts.auth = decodeURIComponent(u.username) + ':' + decodeURIComponent(u.password);
+    }
+    const req = mod.request(opts, (res) => handle(res, null));
+    req.on('error', fail);
     if (body) req.write(body);
     req.end();
 }
@@ -151,6 +223,20 @@ class XMLHttpRequestShim {
 }
 
 // ---------------------------------------------------------------- DOM shims
+// ---- 本单设备档案 (由 Python 侧经 HTJ_PROFILE 环境变量传入) ----
+// 与登录侧 gen_device_profile() 同构: canvas 指纹 / 屏幕 / platform 每单不同。
+// 目的: sofire 侧不再全局固定 —— 否则几百个账号在百度看来是"同一台设备"。
+const PROFILE = (function () {
+    try { return JSON.parse(process.env.HTJ_PROFILE || '{}'); } catch (e) { return {}; }
+})();
+
+// 本单 canvas 指纹 (百度 SDK 的 getFingerPrintCanvas 依赖 canvas 哈希)
+// ⚠️ 原实现的 2d context 根本没有 toDataURL, 百度只能取到空值。
+const CANVAS_FP = (function () {
+    if (PROFILE.canvasFp) return PROFILE.canvasFp;
+    return 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
+})();
+
 function makeElement(tag) {
     const el = {
         tagName: (tag || 'div').toUpperCase(), style: {}, children: [],
@@ -162,6 +248,9 @@ function makeElement(tag) {
         remove() {}, removeChild() {},
         addEventListener(ev, fn) { (this._listeners[ev] = this._listeners[ev] || []).push(fn); },
         removeEventListener() {},
+        // canvas 元素级 toDataURL (原实现缺失 → 百度取不到 canvas 指纹)
+        toDataURL() { return CANVAS_FP; },
+        width: 300, height: 150,
     getContext(type) {
         if ((type || '').includes('2d')) {
             return {
@@ -177,6 +266,8 @@ function makeElement(tag) {
                 save() {}, restore() {}, translate() {}, rotate() {}, scale() {},
                 setTransform() {}, transform() {}, drawImage() {}, arcTo() {}, quadraticCurveTo() {},
                 bezierCurveTo() {}, rect() {}, isPointInPath() { return false; },
+                // 2d context 级 toDataURL (原实现缺失 → 百度取不到 canvas 指纹)
+                toDataURL() { return CANVAS_FP; },
             };
         }
         if ((type || '').includes('webgl')) {
@@ -217,7 +308,7 @@ function makeElement(tag) {
         }
         return null;
     },
-        getBoundingClientRect() { return { top: 0, left: 0, width: 1920, height: 1080, right: 1920, bottom: 1080 }; },
+        getBoundingClientRect() { return { top: 0, left: 0, width: PROFILE.screenW || 1920, height: PROFILE.screenH || 1080, right: PROFILE.screenW || 1920, bottom: PROFILE.screenH || 1080 }; },
         focus() {}, blur() {}, click() {},
         innerText: '', innerHTML: '', value: '', src: '',
         parentNode: { removeChild() {}, insertBefore() {} },
@@ -312,14 +403,20 @@ const navigatorShim = {
     prototype: {},
 };
 
+// ---- 应用本单设备档案到 navigator ----
+if (PROFILE.userAgent) { navigatorShim.userAgent = PROFILE.userAgent; }
+if (PROFILE.platform) { navigatorShim.platform = PROFILE.platform; }
+if (PROFILE.language) { navigatorShim.language = PROFILE.language; navigatorShim.languages = [PROFILE.language]; }
+if (PROFILE.hardwareConcurrency) { navigatorShim.hardwareConcurrency = PROFILE.hardwareConcurrency; }
+if (PROFILE.maxTouchPoints !== undefined) { navigatorShim.maxTouchPoints = PROFILE.maxTouchPoints; }
+
 const windowShim = {
     location: documentShim.location,
     navigator: navigatorShim,
     screen: { width: 1920, height: 1080, availWidth: 1920, availHeight: 1055, colorDepth: 30, pixelDepth: 30 },
     document: documentShim,
     innerWidth: 1920, innerHeight: 945, outerWidth: 1920, outerHeight: 1055,
-    devicePixelRatio: 2,
-    localStorage: {
+    devicePixelRatio: 2,    localStorage: {
         _d: localStorageData,
         getItem(k) { return this._d[k] !== undefined ? this._d[k] : null; },
         setItem(k, v) { this._d[k] = String(v); },
@@ -400,6 +497,24 @@ process.on('exit', () => {
             [...new Set(__winMissing)].join('\n'));
     } catch (e) {}
 });
+
+// ---- 应用本单屏幕参数 (百度 SDK 的 screenData 来源) ----
+if (PROFILE.screenW) {
+    windowShim.screen.width = PROFILE.screenW;
+    windowShim.screen.availWidth = PROFILE.screenW;
+    windowShim.innerWidth = PROFILE.screenW;
+    windowShim.outerWidth = PROFILE.screenW;
+}
+if (PROFILE.screenH) {
+    windowShim.screen.height = PROFILE.screenH;
+    windowShim.screen.availHeight = Math.max(0, PROFILE.screenH - 25);
+    windowShim.innerHeight = Math.max(0, PROFILE.screenH - 135);
+    windowShim.outerHeight = PROFILE.screenH;
+}
+if (PROFILE.colorDepth) {
+    windowShim.screen.colorDepth = PROFILE.colorDepth;
+    windowShim.screen.pixelDepth = PROFILE.colorDepth;
+}
 
 // ---------------------------------------------------------------- 加载 SDK
 global.window = windowProxy;

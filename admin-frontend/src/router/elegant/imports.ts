@@ -24,5 +24,7 @@ export const views: Record<LastLevelRouteKey, RouteComponent | (() => Promise<Ro
   dashboard: () => import("@/views/dashboard/index.vue"),
   manage_agents: () => import("@/views/manage_agents/index.vue"),
   manage_cards: () => import("@/views/manage_cards/index.vue"),
-  manage_pool: () => import("@/views/manage_pool/index.vue"),
+  manage_ipset: () => import("@/views/manage_ipset/index.vue"),
+  manage_logs: () => import("@/views/manage_logs/index.vue"),
+  manage_records: () => import("@/views/manage_records/index.vue"),
 };

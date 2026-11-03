@@ -174,7 +174,9 @@ const routeMap: RouteMap = {
   "manage": "/manage",
   "manage_agents": "/manage/agents",
   "manage_cards": "/manage/cards",
-  "manage_pool": "/manage/pool"
+  "manage_ipset": "/manage/ipset",
+  "manage_logs": "/manage/logs",
+  "manage_records": "/manage/records"
 };
 
 /**

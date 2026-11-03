@@ -65,3 +65,32 @@ export function fetchAgentDeleteCard(id: number) {
 export function fetchAgentBatchDeleteCards(ids: number[]) {
   return request<any>({ url: '/agent/cards/batch-delete', method: 'post', data: { ids } });
 }
+
+/* ---------------- 系统设置 (代理IP / 打码Token / 代理保活) ---------------- */
+export interface KamiSettings {
+  proxy_extract_url: string;
+  jfbym_token: string;
+  proxy_enabled: boolean;
+  proxy_keepalive: number;
+  proxy_ttl: number;
+}
+export function fetchGetSettings() {
+  return request<KamiSettings>({ url: '/admin/settings' });
+}
+export function fetchSaveSettings(data: Partial<KamiSettings>) {
+  return request<any>({ url: '/admin/settings', method: 'post', data });
+}
+/** 测试代理提取链接（拉一条线路验证） */
+export function fetchTestProxy(proxy_extract_url: string) {
+  return request<any>({ url: '/admin/settings/test-proxy', method: 'post', data: { proxy_extract_url } });
+}
+/** 测试打码 Token（查余额） */
+export function fetchTestCaptcha(jfbym_token: string) {
+  return request<any>({ url: '/admin/settings/test-captcha', method: 'post', data: { jfbym_token } });
+}
+
+/* ---------------- 日志 ---------------- */
+/** 拉取协议层日志 (lines: 返回行数) */
+export function fetchLogs(lines?: number) {
+  return request<any>({ url: '/admin/logs', params: { lines } });
+}

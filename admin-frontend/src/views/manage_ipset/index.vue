@@ -16,6 +16,21 @@
             <template #unchecked>关闭</template>
           </n-switch>
         </n-form-item>
+        <n-form-item label="代理 IP 有效期（分钟）" label-placement="top">
+          <n-input-number v-model:value="form.proxy_ttl" :min="0" :max="60" class="w-40">
+            <template #suffix>分钟</template>
+          </n-input-number>
+          <n-text depth="3" class="ml-2">仅用于判断保活间隔是否合理，不参与运行时逻辑</n-text>
+        </n-form-item>
+        <n-form-item label="代理保活间隔（秒）" label-placement="top">
+          <n-input-number v-model:value="form.proxy_keepalive" :min="0" :max="600" class="w-40">
+            <template #suffix>秒</template>
+          </n-input-number>
+          <n-text depth="3" class="ml-2">领取流程进行中每隔该秒数通过本单代理发一次心跳，防止端口空闲过期；0 = 关闭</n-text>
+        </n-form-item>
+        <n-alert v-if="keepaliveWarning" type="warning" :show-icon="true" class="mb-4">
+          {{ keepaliveWarning }}
+        </n-alert>
         <n-space>
           <n-button type="primary" :loading="saving" @click="save">保存设置</n-button>
           <n-button :loading="testingProxy" @click="testProxy">测试提取链接</n-button>
@@ -49,9 +64,8 @@
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted } from 'vue';
-import { NCard, NFormItem, NInput, NButton, NSpace, NSwitch,
-         NAlert, NTag, useMessage } from 'naive-ui';
+import { ref, onMounted, computed } from 'vue';
+import { NCard, NFormItem, NInput, NButton, NSpace, NSwitch, NAlert, NTag, NInputNumber, NText, useMessage } from 'naive-ui';
 import { fetchGetSettings, fetchSaveSettings, fetchTestProxy, fetchTestCaptcha } from '@/service/api/kami';
 
 const message = useMessage();
@@ -65,6 +79,18 @@ const form = ref({
   proxy_extract_url: '',
   jfbym_token: '',
   proxy_enabled: true,
+  proxy_keepalive: 0,
+  proxy_ttl: 0,
+});
+
+/** 保活间隔是否合理：心跳必须赶在端口空闲过期之前 */
+const keepaliveWarning = computed(() => {
+  const { proxy_keepalive: ka, proxy_ttl: ttl } = form.value;
+  if (!ka || !ttl) return '';
+  if (ka >= ttl * 60) {
+    return `保活间隔 ${ka} 秒 ≥ 代理有效期 ${ttl} 分钟，心跳可能赶在端口过期之后才发出，建议把保活间隔调到 ${Math.max(10, Math.floor(ttl * 60 / 2))} 秒以内`;
+  }
+  return '';
 });
 
 onMounted(async () => {
@@ -74,6 +100,8 @@ onMounted(async () => {
       proxy_extract_url: data.proxy_extract_url || '',
       jfbym_token: data.jfbym_token || '',
       proxy_enabled: data.proxy_enabled !== false,
+      proxy_keepalive: Number(data.proxy_keepalive) || 0,
+      proxy_ttl: Number(data.proxy_ttl) || 0,
     };
   }
 });
@@ -83,7 +111,8 @@ async function save() {
   try {
     const { error } = await fetchSaveSettings(form.value);
     if (error) return message.error('保存失败');
-    message.success('设置已保存，即时生效');
+    if (keepaliveWarning.value) message.warning('已保存，但保活间隔与代理有效期不匹配，建议调整');
+    else message.success('设置已保存，即时生效');
   } finally {
     saving.value = false;
   }

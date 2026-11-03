@@ -128,13 +128,30 @@ export const generatedRoutes: GeneratedRoute[] = [
         }
       },
       {
-        name: 'manage_pool',
-        path: '/manage/pool',
-        component: 'view.manage_pool',
+        name: 'manage_ipset',
+        path: '/manage/ipset',
+        component: 'view.manage_ipset',
         meta: {
-          title: 'manage_pool',
-          i18nKey: 'route.manage_pool',
-          order: 3
+          title: 'manage_ipset',
+          i18nKey: 'route.manage_ipset'
+        }
+      },
+      {
+        name: 'manage_logs',
+        path: '/manage/logs',
+        component: 'view.manage_logs',
+        meta: {
+          title: 'manage_logs',
+          i18nKey: 'route.manage_logs'
+        }
+      },
+      {
+        name: 'manage_records',
+        path: '/manage/records',
+        component: 'view.manage_records',
+        meta: {
+          title: 'manage_records',
+          i18nKey: 'route.manage_records'
         }
       }
     ]

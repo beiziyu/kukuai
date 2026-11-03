@@ -97,6 +97,31 @@ def jfbym_token() -> str:
 def proxy_extract_url() -> str:
     return get_setting("proxy_extract_url", "")
 
+
+def proxy_keepalive() -> int:
+    """代理保活间隔 (秒), 0 = 关闭
+
+    背景: 部分代理渠道 (如星雨) 的线路【空闲超过 1 分钟端口即过期】,
+    而本流程从"发短信"到"用户输入验证码"之间有一段人工等待,
+    这段时间代理无请求 → 端口被回收 → 后续登录必然失败。
+    保活线程按间隔通过【该单自己的 client】(即同一条锁定 IP) 发一个
+    轻量请求, 既能续命, 又不违反"一单一条 IP"的原则。"""
+    try:
+        return max(0, int(get_setting("proxy_keepalive", "0") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def proxy_ttl() -> int:
+    """代理 IP 有效期 (分钟), 0 = 未知
+
+    仅用于判断"该不该保活": 有效期 <= 保活间隔时说明保活间隔太长,
+    心跳可能赶在端口过期之后才发出去 (管理端会提示)。"""
+    try:
+        return max(0, int(get_setting("proxy_ttl", "0") or 0))
+    except (TypeError, ValueError):
+        return 0
+
 app = FastAPI(title="kuku claim-api", version="2.0.0")
 _executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
 
@@ -124,10 +149,15 @@ def _get_session(kami: str) -> dict:
     return s
 
 
-def client_from_ck(ck_str: str):
-    """用存档的 CK 字符串重建会话客户端 (后台重领用)"""
+def client_from_ck(ck_str: str, proxy: str = ""):
+    """用存档的 CK 字符串重建会话客户端 (后台重领用)
+
+    ⚠️ proxy 必须传入【原单的那条 91 代理】。
+       旧版这里是无参 Client() → proxy=None → 从服务器机房 IP 直连领奖,
+       等于把客户账号绑到机房 IP, 是最致命的一处风控关联。
+       只有只读复核(查会员状态)才允许不传 proxy。"""
     import http.cookiejar
-    client = Client()
+    client = Client(proxy=proxy) if proxy else Client()
     for part in (ck_str or '').split(';'):
         part = part.strip()
         if '=' in part:
@@ -140,10 +170,11 @@ def client_from_ck(ck_str: str):
 
 
 # 后台自动重领队列: 领奖被 8001 限流的订单, 用存档 CK 定时重试
-_reclaim_queue = []          # [{kami, phone, day, ck_after, attempts, next_ts}]
+# ⚠️ 复用【原单的代理 IP】(proxy 字段), 不从机房 IP 直连领奖
+_reclaim_queue = []          # [{kami, phone, day, ck_after, proxy, attempts, next_ts}]
 _reclaim_lock = threading.Lock()
-RECLAIM_INTERVAL = 90        # 每 90 秒重试一次
-RECLAIM_MAX_ATTEMPTS = 13    # 最多 ~20 分钟
+RECLAIM_INTERVAL = 15        # 每 15 秒重试一次
+RECLAIM_MAX_ATTEMPTS = 2     # 最多重试 2 次
 
 
 def _estimate_expire(day: int) -> str:
@@ -163,7 +194,8 @@ def _reclaim_worker():
         for e in due:
             kami, phone, day = e["kami"], e["phone"], e["day"]
             try:
-                bot = KukuBot(client_from_ck(e["ck_after"]), dry_run=False)
+                # ★ 复用原单代理 IP: 重领和首次领奖走同一条 IP, 同一套设备档案
+                bot = KukuBot(client_from_ck(e["ck_after"], e.get("proxy", "")), dry_run=False)
                 e["attempts"] += 1
                 core_log(f"[{phone}] 后台重领 day={day} (第{e['attempts']}次)", "INFO")
                 if bot.claim_reward(int(day)):
@@ -202,6 +234,53 @@ def _reclaim_worker():
 
 
 threading.Thread(target=_reclaim_worker, daemon=True).start()
+
+
+# ---------------------------------------------------------------- 代理保活
+# 部分代理渠道 (如星雨) 的线路空闲超过 1 分钟端口即过期。本流程从"发短信"
+# 到"用户输入验证码"之间有一段人工等待, 期间代理无请求 → 端口被回收 →
+# 后续登录/领奖必然失败。
+#
+# 保活方式: 按间隔用【该单自己的 client】发一个轻量请求 (走同一条锁定 IP)。
+#   · 不换 IP, 不换指纹 → 严格保持"一单一条 IP + 一套指纹"
+#   · 不影响 Cookie / 会话状态 (只读请求)
+def _keepalive_worker():
+    while True:
+        time.sleep(15)
+        interval = proxy_keepalive()
+        if interval <= 0:
+            continue
+        now = time.time()
+        try:
+            with _LOCK:
+                sessions = list(_SESSIONS.values())
+        except Exception:
+            continue
+        for s in sessions:
+            # 只保活仍在进行中的会话 (等验证码 / 领奖中)
+            if s.get("state") not in ("ready", "sms_sent", "logged_in", "running"):
+                continue
+            client = s.get("client")
+            if client is None or not getattr(client, "proxy", None):
+                continue
+            # 距上次使用不足间隔 → 跳过 (避免请求过密)
+            last = s.get("last_use_ts", 0)
+            if now - last < interval:
+                continue
+            try:
+                # 保活请求打 www.baidu.com 的 robots.txt (极轻量, 不下载 JS/图片)
+                # 只为让代理端口保持有出站流量, 不关心返回内容与状态码
+                try:
+                    client.request("https://www.baidu.com/robots.txt",
+                                   headers={"Referer": "https://www.baidu.com/"}, timeout=8)
+                except Exception:
+                    pass          # 连不上不影响主流程, 下轮再试
+                s["last_use_ts"] = time.time()
+            except Exception as ex:
+                core_log(f"[{s.get('phone', '?')}] 代理保活失败: {type(ex).__name__}", "WARN")
+
+
+threading.Thread(target=_keepalive_worker, daemon=True).start()
 
 
 def jar_to_str(client) -> str:
@@ -427,14 +506,17 @@ def claim_run(req: ClaimRunReq):
                 status = "success"
                 result_msg = "会员开通成功"
             elif pending:
-                # 8001 限流未领到 → 入后台自动重领队列 (用存档CK, 最多20分钟)
+                # 8001 限流未领到 → 入后台自动重领队列 (用存档CK + 原单代理IP)
                 # 订单保持 running, 客户端继续等待; 成功/最终失败都回调
                 day = int(pending[0])
                 with _reclaim_lock:
                     _reclaim_queue.append({"kami": kami, "phone": phone, "day": day,
-                                           "ck_after": ck_after, "attempts": 0,
-                                           "next_ts": time.time() + 60})
-                core_log(f"[{phone}] day={day} 未领到 → 入队自动重领 (最多20分钟)", "WARN")
+                                           "ck_after": ck_after,
+                                           "proxy": getattr(client, "proxy", "") or "",
+                                           "attempts": 0,
+                                           "next_ts": time.time() + 15})
+                core_log(f"[{phone}] day={day} 未领到 → 入队自动重领 (最多重试{RECLAIM_MAX_ATTEMPTS}次)",
+                         "WARN")
                 result_msg = "奖励待发放, 系统自动重试领取中"
                 member_expire_at = _estimate_expire(day)
                 status = "success"

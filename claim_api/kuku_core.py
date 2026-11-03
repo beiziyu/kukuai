@@ -55,8 +55,10 @@ UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
 
 KUKU_HOST = "https://kuku.baidu.com"
 PASSPORT_HOST = "https://passport.baidu.com"
-# 设备指纹 fuid (fingerprint.js 确定性生成, 替代原先空值)
-FUID = "49fe9b56ddec8ca1633da8a13e52a8e4"
+# ⚠️ 不要在这里放任何"全局固定"的设备指纹常量。
+#   旧版有个 FUID 常量兜底, 拿不到本单指纹时送它 —— 等于把所有客户账号
+#   在百度侧绑成同一台设备 (几百个号共用一个 fuid), 正是批量薅羊毛画像。
+#   设备指纹由 bridge.js 按本单 profile 实时算出; 算不出就不传该字段。
 
 
 def gen_device_profile():
@@ -479,7 +481,8 @@ class Client:
         if prev.get("jfbym_token"):
             cfg["jfbym_token"] = prev["jfbym_token"]
         # ⚠️ 保留代理提取地址等设置 (否则登录成功后配置被覆盖, 回退默认)
-        for _k in ("proxy_extract_url", "proxy_enabled"):
+        for _k in ("proxy_extract_url", "proxy_enabled",
+                   "proxy_keepalive", "proxy_ttl"):
             if prev.get(_k) is not None:
                 cfg[_k] = prev[_k]
         if extra:
@@ -637,6 +640,11 @@ class SmsLogin:
         # 每单独立虚拟设备档案 (单内固定, 单间不同 → 避免被判定"同设备批量登录")
         self._profile = gen_device_profile()
         self._fuid = ""   # 本单设备指纹 (首次签名时由 bridge.js 算出)
+        # ★ 同一单的 profile 必须贯穿全程 (登录 → 领奖)。
+        #   登录侧 bridge.js 和领奖侧 htj_bridge.js 用的是同一份, 否则百度侧
+        #   会看到"登录是一台设备、领奖是另一台设备"的两台设备画像。
+        #   挂在 client 上: client 就是贯穿整单的那个对象。
+        client._profile = self._profile
 
     # ------------------------------------------------------------ 签名工具
     @staticmethod
@@ -904,8 +912,12 @@ class SmsLogin:
               "smsisagree": "on", "fp_uid": "", "fp_info": "", "client": "",
               "isupsms": "", "channelid": "", "countrycode": "",
               "loginversion": "v5", "dv": self._dv, "bdint_sync_cookie": "0",
-              "fuid": self._fuid or FUID, "traceid": gen_traceid(),
-              "callback": gen_callback()}
+              "traceid": gen_traceid(), "callback": gen_callback()}
+        # ★ fuid: 本单设备指纹 (bridge.js 按本单 profile 算出, getapi 阶段已就绪)。
+        #   算不出来就不传这个字段 —— 绝不送全局固定值, 否则所有客户账号
+        #   在百度侧会被认成同一台设备 (批量薅羊毛画像)。
+        if self._fuid:
+            lp["fuid"] = self._fuid
         sig4 = self._moonshad_sign(lp)
         body = self._post(f"{PASSPORT_HOST}/v2/api/?login", {
             **lp, "time": sig4["time"], "alg": sig4["alg"], "sig": sig4["sig"],
@@ -982,6 +994,10 @@ class KukuBot:
         self.uinfo = None
         self.uk = None
         self._js_token = None
+        # ★ 本单设备档案: 优先从 client 取 (与登录侧同一份)。
+        #   client 上没有时 (例如后台重领队列重建会话) 才自己生成一份。
+        self._profile = getattr(client, "_profile", None) or gen_device_profile()
+        client._profile = self._profile
 
     # ------------------------------------------------------------- helpers
     def _qs(self, extra=None):
@@ -1213,41 +1229,43 @@ class KukuBot:
         m = re.search(r'fn%28%22([0-9A-F]+)%22%29', raw) or re.search(r'fn\("([0-9A-F]+)"\)', urllib.parse.unquote(raw))
         return m.group(1) if m else ""
 
-    @staticmethod
-    def gen_jt(href=REFERER_ACT, err="dfxaf3 failed to load"):
-        """生成领奖 jt: 优先运行真实 dfxaf3 SDK (Node 桥接, 31$ 格式);
-        桥接失败时降级为本地算法 (30$CODED--v30 移位编码)"""
+    def gen_jt(self, href=REFERER_ACT):
+        """生成领奖 jt: 由百度 sofire 实时签发 (Node 桥接跑官方 dfxaf3 SDK)
+
+        ⚠️ 必须是实例方法 (原为 @staticmethod): sofire 上报要和领奖请求
+           用【同一条 91 代理 IP】+【同一套本单设备档案】, 否则百度侧看到
+           "登录用代理IP、领奖凭证申请用机房IP" 的矛盾, 以及
+           "登录侧每单随机指纹、领奖侧全局写死设备" 的两台设备画像。
+           静态方法拿不到 self.c (client) 和 self._profile, 物理上做不到。
+
+        ⚠️ jt 只能来自百度签发。原版本有一条「本地伪造降级路径」
+           (30$CODED--v30 + 硬编码错误串 "dfxaf3 failed to load"),
+           那是我当初写错的兜底: 伪造凭证没有百度签名, 领到的奖必然被回收,
+           而卡密已核销 → 客户既没会员也没卡密。已彻底移除:
+           拿不到就明确失败, 不发起领奖请求 —— 宁可不领, 也不拿假凭证去领。
+        """
         bridge = os.path.join(SCRIPT_DIR, "jsbridge", "htj_bridge.js")
-        if os.path.exists(bridge):
-            try:
-                out = subprocess.run(["node", bridge],
-                                     capture_output=True, text=True, timeout=40)
-                line = out.stdout.strip().splitlines()[-1] if out.stdout.strip() else ""
-                d = json.loads(line)
-                if d.get("ok") and d.get("jt"):
-                    return d["jt"]
-            except Exception:
-                pass
-        # 本地降级算法
-        bid_n = ""
+        if not os.path.exists(bridge):
+            raise RuntimeError(f"缺少反作弊凭证组件: {bridge}")
+        # ★ 把本单的 91 代理 IP + 本单设备档案传给 Node:
+        #   sofire 上报必须和领奖请求走同一条 IP、用同一套设备档案,
+        #   否则百度侧看到"登录用代理IP/随机指纹、领奖凭证申请用机房IP/写死设备"。
+        env = dict(os.environ)
+        env["HTJ_PROXY"] = getattr(self.c, "proxy", "") or ""
+        env["HTJ_PROFILE"] = json.dumps(self._profile or {})
         try:
-            bid_n = next((c.value for c in next(
-                j for j in [Client().jar] if j).cookies if c.name == "__bid_n"), "")
-        except Exception:
-            bid_n = ""
-        if not bid_n:
-            bid_n = "0x1x" + str(int((random.random() + random.randint(1, 9)) * 1e9))
-        raw = f"{bid_n}|{href}|{int(time.time() * 1000)}|{err}"
-        b64 = base64.b64encode(raw.encode()).decode()
-        out = []
-        for i, ch in enumerate(b64):
-            n = ord(ch)
-            o = i % 32
-            if 41 <= n <= 122:
-                out.append(chr(40 + n - 122 + o) if 122 < n + o else chr(n + o))
-            else:
-                out.append(ch)
-        return "30$CODED--v30" + "".join(out)
+            out = subprocess.run(["node", bridge], capture_output=True, text=True,
+                                 timeout=40, env=env)
+        except subprocess.TimeoutExpired:
+            raise RuntimeError("反作弊凭证生成超时 (不发起领奖)")
+        line = out.stdout.strip().splitlines()[-1] if out.stdout.strip() else ""
+        try:
+            d = json.loads(line)
+        except (json.JSONDecodeError, IndexError):
+            d = {}
+        if not (d.get("ok") and d.get("jt")):
+            raise RuntimeError(f"反作弊凭证获取失败 (不发起领奖): {d or line[:200]}")
+        return d["jt"]
 
     CLAIM_GAP = 30          # 全局领奖最小间隔(秒), 防止触发库库风控
     _last_claim_ts = 0.0
@@ -1398,15 +1416,19 @@ def judge_account(home):
         f"day{a['day']}({a['prize']})" for a in awards
         if a.get("state") == 2 or a["day"] in claimed)
 
-    # 天卡已领取 → 无效号
+    # 天卡已领取 → 不再判定为无效号
+    # ⚠️ 实测: 库库活动按【周期】发奖, 已领过天卡的号补签到下一个里程碑后
+    #   还能再领一份网盘天卡 (并非终身一次性)。旧版把"已领过"直接判无效,
+    #   会把本可再领的号挡在门外 (卡密不核销, 客户白跑一趟)。
+    #   改为: 视为有效, 交由 run_flow 按 continuous_awards 的 state 决定领哪个里程碑。
     if target.get("state") == 2 or day in claimed:
-        return {"valid": False,
-                "reason": f"该号已领取过天卡 (day={day} {target['prize']}), "
-                          f"同一奖励只能领一次, 补签无意义",
+        return {"valid": True,
+                "reason": f"天卡 (day={day}) 已领取过, 继续推进下一里程碑 (可再领)",
                 "total": total, "continuous": continuous,
                 "claimed_desc": claimed_desc or f"day{day}",
                 "target_day": day, "need_days": 0, "can_makeup": 0,
-                "need_makeup": False, "direct_claim": False}
+                "need_makeup": False, "direct_claim": False,
+                "already_claimed": True}
 
     # 天卡已达成, 待领取
     if target.get("state") == 1:
@@ -1580,8 +1602,11 @@ def run_flow(bot, no_makeup=False, no_claim=False, dry_run=False,
         for a in claimable:
             log(f"领取 {a['day']} 天奖励: {a['prize']} ...")
             got_it = False
-            # IP 有效期 10 分钟, 限流重试咬满整个窗口 (~8.5 分钟)
-            backoff = [8, 10, 12, 15, 15, 18, 20, 20, 22, 25] + [30] * 14
+            # ⚠️ 限流(8001)重试预算收敛: 最多领 2 次, 间隔 15 秒。
+            #   旧版是 24 次退避重试 (咬满 8.5 分钟), 实测同一 day=3 在
+            #   36 分钟内被百度拒 12 次 —— 那是"异常领奖频次"特征。
+            #   8001 语义是"稍后重试"而非"拒绝", 死磕 24 次没有意义。
+            backoff = [15]
             for attempt, wait in enumerate(backoff, 1):
                 if bot.claim_reward(a["day"]):
                     got_it = True
