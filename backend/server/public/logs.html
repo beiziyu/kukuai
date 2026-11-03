@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>协议执行日志</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: #0f1419; color: #d4d8dd; font-family: 'SF Mono', Consolas, monospace; padding: 16px; }
+  .bar { display: flex; gap: 10px; align-items: center; margin-bottom: 12px; flex-wrap: wrap; }
+  .bar button { background: #1f6feb; color: #fff; border: 0; padding: 7px 14px; border-radius: 6px; cursor: pointer; font-size: 13px; }
+  .bar button.off { background: #30363d; }
+  .bar input { flex: 1; min-width: 220px; background: #161b22; border: 1px solid #30363d; color: #d4d8dd; padding: 7px 10px; border-radius: 6px; font-size: 13px; }
+  .bar .status { font-size: 12px; color: #8b949e; }
+  pre { white-space: pre-wrap; word-break: break-all; font-size: 12.5px; line-height: 1.55; background: #0a0e13; border: 1px solid #21262d; border-radius: 8px; padding: 14px; min-height: 70vh; overflow-y: auto; }
+  .warn { color: #d29922; } .err { color: #f85149; } .ok { color: #3fb950; }
+</style>
+</head>
+<body>
+  <div class="bar">
+    <input id="token" placeholder="管理端 Token (从浏览器 localStorage 或粘贴)" />
+    <button id="go">开始拉取</button>
+    <button id="pause" class="off">暂停</button>
+    <span class="status" id="st"></span>
+  </div>
+  <pre id="log">点击「开始拉取」加载协议执行日志 (自动每3秒刷新)</pre>
+
+<script>
+const pre = document.getElementById('log');
+const st = document.getElementById('st');
+const tokenInput = document.getElementById('token');
+let timer = null;
+
+// 尝试自动从 localStorage 读 token (常见键名)
+const keys = ['token', 'admin_token', 'kami_token', 'auth_token', 'jwt'];
+for (const k of keys) {
+  const v = localStorage.getItem(k);
+  if (v) { tokenInput.value = v; break; }
+}
+
+function esc(s) {
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+function colorize(line) {
+  let c = '';
+  if (/失败|异常|错误|ERR|error|WARN|不可用|风险|errno|超时/.test(line)) c = ' class="warn"';
+  if (/✅|成功|已发送|已领取|OK/.test(line)) c = ' class="ok"';
+  return `<span${c}>${esc(line)}</span>`;
+}
+
+async function poll() {
+  const token = tokenInput.value.trim();
+  if (!token) { st.textContent = '请先填 token'; return; }
+  try {
+    const r = await fetch('/api/admin/logs?lines=500', { headers: { Authorization: 'Bearer ' + token } });
+    const d = await r.json();
+    if (!d || !Array.isArray(d.lines)) { st.textContent = '返回异常: ' + JSON.stringify(d).slice(0, 80); return; }
+    pre.innerHTML = d.lines.map(colorize).join('\n');
+    pre.scrollTop = pre.scrollHeight;
+    st.textContent = '更新于 ' + new Date().toLocaleTimeString() + ' · ' + d.lines.length + ' 行';
+  } catch (e) {
+    st.textContent = '请求失败: ' + e.message;
+  }
+}
+
+document.getElementById('go').onclick = () => { poll(); if (!timer) timer = setInterval(poll, 3000); };
+document.getElementById('pause').onclick = function () {
+  if (timer) { clearInterval(timer); timer = null; this.classList.add('off'); this.textContent = '已暂停'; }
+  else { this.classList.remove('off'); this.textContent = '暂停'; timer = setInterval(poll, 3000); poll(); }
+};
+</script>
+</body>
+</html>
