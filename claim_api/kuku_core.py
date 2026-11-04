@@ -987,6 +987,8 @@ class SmsLogin:
 
 
 class KukuBot:
+    CLAIM_GAP = 30          # 单个账号的领奖最小间隔(秒)
+
     def __init__(self, client: Client, dry_run=False):
         self.c = client
         self.dry_run = dry_run
@@ -998,6 +1000,14 @@ class KukuBot:
         #   client 上没有时 (例如后台重领队列重建会话) 才自己生成一份。
         self._profile = getattr(client, "_profile", None) or gen_device_profile()
         client._profile = self._profile
+        # ★ 领奖限速改为【每单独立】: 锁与时间戳挂在 client 上 (client 贯穿整单)。
+        #   旧版是类级全局锁 —— 不同账号的领奖请求互相排队, 白白拖慢。
+        #   现在每单各限各的, 多个号可以真正并行领取。
+        #   (每个号用各自的 91 代理 IP, 百度侧本来就分不出它们是一伙的)
+        if not hasattr(client, "_claim_lock"):
+            client._claim_lock = threading.Lock()
+            client._last_claim_ts = 0.0
+        self._claim_lock = client._claim_lock
 
     # ------------------------------------------------------------- helpers
     def _qs(self, extra=None):
@@ -1267,21 +1277,17 @@ class KukuBot:
             raise RuntimeError(f"反作弊凭证获取失败 (不发起领奖): {d or line[:200]}")
         return d["jt"]
 
-    CLAIM_GAP = 30          # 全局领奖最小间隔(秒), 防止触发库库风控
-    _last_claim_ts = 0.0
-    _claim_lock = threading.Lock()
-
     def claim_reward(self, day):
         """领取里程碑奖励 (jsToken + 本地生成 jt, 与浏览器降级路径一致)
-        全局限速: 服务器所有账号的领奖请求间隔 >=CLAIM_GAP 秒 (防触发库库风控)"""
-        with KukuBot._claim_lock:
-            wait = KukuBot.CLAIM_GAP - (time.time() - KukuBot._last_claim_ts)
+        限速: 【本单】的领奖请求间隔 >=CLAIM_GAP 秒 (不同账号互不阻塞)"""
+        with self._claim_lock:
+            wait = self.CLAIM_GAP - (time.time() - self.c._last_claim_ts)
             if wait > 0:
-                log(f"全局限速: 等待 {int(wait)} 秒 (降低风控触发)", "INFO")
+                log(f"限速: 等待 {int(wait)} 秒 (本单间隔控制)", "INFO")
                 time.sleep(wait)
+            self.c._last_claim_ts = time.time()
             if self.dry_run:
                 log(f"[演练] 跳过领取 day={day} 奖励", "WARN")
-                KukuBot._last_claim_ts = time.time()
                 return False
         js_token = self.js_token(refresh=True)
         jt = self.gen_jt()
@@ -1297,7 +1303,6 @@ class KukuBot:
         except Exception as ex:
             log(f"领奖请求异常: {ex}", "ERR")
             return False
-        KukuBot._last_claim_ts = time.time()
         errno = r.get("errno")
         msg = r.get("errmsg") or r.get("show_msg") or ""
         if errno == 0:
