@@ -988,6 +988,17 @@ class SmsLogin:
 
 class KukuBot:
     CLAIM_GAP = 30          # 单个账号的领奖最小间隔(秒)
+    # ★ 跨账号的领奖最小间隔(秒) —— 必须保留!
+    #   实测 (2026-11-04): 完全放开并发后, 百度按【活动维度】聚合检测到
+    #   "短时间多账号领奖", 领奖接口批量返回 errno=8043 need check:
+    #     09:00-09:49  登录成功 10 / 领奖成功 6  / 8043 = 0
+    #     09:49-10:30  登录成功 10 / 领奖成功 1  / 8043 = 10
+    #   (登录成功率不变 → 不是代理问题, 是领奖请求密度触发了活动侧风控)
+    #   所以: 登录/补签阶段仍然完全并发 (占 90% 耗时), 只有最后"领奖"这一步
+    #   跨账号错开 CLAIM_GLOBAL_GAP 秒 —— 既止血, 又几乎不损失吞吐。
+    CLAIM_GLOBAL_GAP = 20
+    _global_claim_lock = threading.Lock()
+    _global_last_claim_ts = 0.0
 
     def __init__(self, client: Client, dry_run=False):
         self.c = client
@@ -1000,10 +1011,7 @@ class KukuBot:
         #   client 上没有时 (例如后台重领队列重建会话) 才自己生成一份。
         self._profile = getattr(client, "_profile", None) or gen_device_profile()
         client._profile = self._profile
-        # ★ 领奖限速改为【每单独立】: 锁与时间戳挂在 client 上 (client 贯穿整单)。
-        #   旧版是类级全局锁 —— 不同账号的领奖请求互相排队, 白白拖慢。
-        #   现在每单各限各的, 多个号可以真正并行领取。
-        #   (每个号用各自的 91 代理 IP, 百度侧本来就分不出它们是一伙的)
+        # 本单独立的限速锁 (同单内部仍受 CLAIM_GAP 保护)
         if not hasattr(client, "_claim_lock"):
             client._claim_lock = threading.Lock()
             client._last_claim_ts = 0.0
@@ -1279,7 +1287,18 @@ class KukuBot:
 
     def claim_reward(self, day):
         """领取里程碑奖励 (jsToken + 本地生成 jt, 与浏览器降级路径一致)
-        限速: 【本单】的领奖请求间隔 >=CLAIM_GAP 秒 (不同账号互不阻塞)"""
+        限速:
+          - 本单内: 两次领奖请求间隔 >= CLAIM_GAP (30s)
+          - 跨账号: 任意两个账号的领奖请求间隔 >= CLAIM_GLOBAL_GAP (20s)
+            (百度按活动维度聚合, 密度过高会返回 errno=8043 need check)"""
+        # ---- 跨账号节流: 先排队, 保证全局密度 ----
+        with KukuBot._global_claim_lock:
+            gwait = KukuBot.CLAIM_GLOBAL_GAP - (time.time() - KukuBot._global_last_claim_ts)
+            if gwait > 0:
+                log(f"全局限速: 等待 {int(gwait)} 秒 (控制活动侧请求密度)", "INFO")
+                time.sleep(gwait)
+            KukuBot._global_last_claim_ts = time.time()
+        # ---- 本单内节流 ----
         with self._claim_lock:
             wait = self.CLAIM_GAP - (time.time() - self.c._last_claim_ts)
             if wait > 0:
