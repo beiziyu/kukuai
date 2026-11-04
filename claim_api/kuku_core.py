@@ -1353,6 +1353,35 @@ class KukuBot:
         self._jt_token = d.get("token") or ""
         return d["jt"]
 
+    def browser_claim(self, day):
+        """浏览器降级领奖: 用 Playwright 打开真实活动页, 点「登录领奖」
+
+        为什么需要:
+          errno=8043 (passSpinCode) = 百度要求【旋转验证码】。
+          纯协议路径没有验证码交互能力, 只能过不了。
+          真实浏览器里前端 badjs-sdk 会弹验证码, 过掉后重发 claimreward。
+
+        返回: (ok: bool, info: dict)
+        """
+        bridge = os.path.join(SCRIPT_DIR, "jsbridge", "browser_claim.js")
+        if not os.path.exists(bridge):
+            return False, {"stage": "no-bridge", "msg": "browser_claim.js 不存在"}
+        env = dict(os.environ)
+        env["HTJ_PROXY"] = getattr(self.c, "proxy", "") or ""
+        try:
+            out = subprocess.run(
+                ["node", bridge, self._cookie_string(), str(day)],
+                capture_output=True, text=True, timeout=180, env=env,
+                cwd=os.path.dirname(bridge))
+        except subprocess.TimeoutExpired:
+            return False, {"stage": "timeout", "msg": "浏览器领奖超时"}
+        line = (out.stdout or "").strip().splitlines()[-1] if (out.stdout or "").strip() else ""
+        try:
+            info = json.loads(line)
+        except Exception:
+            info = {"stage": "parse", "msg": (line or (out.stderr or ""))[:200]}
+        return bool(info.get("ok")), info
+
     def claim_reward(self, day):
         """领取里程碑奖励 (jsToken + 本地生成 jt, 与浏览器降级路径一致)
         限速:
@@ -1405,6 +1434,18 @@ class KukuBot:
             log(f"day={day} 返回 8011(假成功, 实测永不下发): {msg} —— 按失败处理", "WARN")
             return False
         log(f"day={day} 领奖失败: errno={errno} {msg}", "WARN")
+        # ★ errno=8043 = passSpinCode (百度要求旋转验证码, 见前端 SDK 错误码表)。
+        #   纯协议路径过不了这类交互式验证 → 降级到真实浏览器:
+        #   由前端 badjs-sdk 弹验证码并完成领奖。
+        if errno == 8043:
+            log(f"day={day} 需要旋转验证码(8043) → 降级到浏览器领奖", "WARN")
+            ok, info = self.browser_claim(day)
+            if ok:
+                log(f"day={day} 浏览器领奖成功! {info.get('msg') or ''}", "OK")
+                return True
+            log(f"day={day} 浏览器领奖未成功: {info.get('stage')} {info.get('msg')}", "WARN")
+            log("    请到活动页手动领取: https://kuku.baidu.com/operation/activitys/kukuPcSignAct/main")
+            return False
         log("    请到活动页手动领取: https://kuku.baidu.com/operation/activitys/kukuPcSignAct/main")
         return False
 
