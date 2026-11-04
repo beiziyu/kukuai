@@ -131,12 +131,30 @@ TID_LOTTERY = "652831792323"   # 抽奖/商品列表
 AID_ACTIVITY = "15459"         # claimreward 的 aid 参数
 
 # 通用查询串 (所有 kuku 接口公共参数)
+# ⚠️ version 必须用 1.8.2 —— 真实浏览器抓包就是这个值 (1.7.3 是旧版, 已被判异常)
 COMMON_QS = {
     "clienttype": "400",
     "app_id": "123971023",
     "web": "1",
     "channel": "chunlei",
-    "version": "1.7.3",
+    "version": "1.8.2",
+}
+
+# ★ 真实浏览器请求头 (来自活动页抓包 capture.har)
+#   缺这些 → 百度风控识别为脚本 → claimreward 返回 8001 (HTJ_ERROR)
+BROWSER_HEADERS = {
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "zh-CN,zh;q=0.9",
+    "Origin": "https://kuku.baidu.com",
+    "User-Agent": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                   "AppleWebKit/537.36 (KHTML, like Gecko) "
+                   "Chrome/156.0.0.0 Safari/537.36"),
+    "Sec-Ch-Ua": '"Not:A-Brand";v="8", "Chromium";v="156", "Google Chrome";v="156"',
+    "Sec-Ch-Ua-Mobile": "?0",
+    "Sec-Ch-Ua-Platform": '"macOS"',
+    "Sec-Fetch-Dest": "empty",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Site": "same-origin",
 }
 
 REFERER_APP = "https://kuku.baidu.com/app"
@@ -1007,6 +1025,7 @@ class KukuBot:
         self.uinfo = None
         self.uk = None
         self._js_token = None
+        self._jt_token = ""       # xaf.getData().Token (前端 window.jsToken)
         # ★ 本单设备档案: 优先从 client 取 (与登录侧同一份)。
         #   client 上没有时 (例如后台重领队列重建会话) 才自己生成一份。
         self._profile = getattr(client, "_profile", None) or gen_device_profile()
@@ -1025,9 +1044,15 @@ class KukuBot:
         return urllib.parse.urlencode(d)
 
     def _h(self, referer=REFERER_APP, xhr=False):
-        h = {"Referer": referer}
+        """请求头
+        ⚠️ 必须伪装成真实 Chrome: urllib 默认 UA 是 "Python-urllib/3.x",
+           百度风控一眼识别 → claimreward 直接返回 8001 (HTJ_ERROR)。
+           头字段取自真实浏览器抓包 (活动页 /act/v2/kukuai30/homepage 的请求)。"""
+        h = dict(BROWSER_HEADERS)
+        h["Referer"] = referer
         if xhr:
             h["X-Requested-With"] = "XMLHttpRequest"
+            h["Content-Type"] = "application/json;charset=UTF-8"
         return h
 
     def js_token(self, refresh=False):
@@ -1240,12 +1265,48 @@ class KukuBot:
 
     # ------------------------------------------------------------- 4 领奖
     def get_js_token(self):
-        r = self.c.get_json(f"{KUKU_HOST}/operation/activitys/api/getJsToken",
-                            headers=self._h(REFERER_ACT, xhr=True))
-        raw = (r.get("data") or {}).get("jsToken", "")
+        """活动反作弊 jsToken (getJsToken 接口)
+
+        ⚠️ 这个接口必须带公共参数, 否则 404 (前端 axios 拦截器会自动合并
+           KUKU_PROFILE_PARAMS + js_env + app + clienttype)。
+        ⚠️ 返回的 jsToken 是一段 JS 字符串, 前端用 eval 执行后才得到
+           window.jsToken —— 这里做等价的提取。
+        ⚠️ 取不到时不要静默返回空: 空 jsToken 会让 claimreward 返回
+           8002 (JSTOKEN_ERROR) / 8001 (HTJ_ERROR), 排查时看不出原因。
+        """
+        q = dict(COMMON_QS)
+        q.update({"js_env": "h5", "app": "universe", "aid": AID_ACTIVITY,
+                  "tid": TID_SIGN})
+        try:
+            r = self.c.get_json(f"{KUKU_HOST}/operation/activitys/api/getJsToken?"
+                                f"{urllib.parse.urlencode(q)}",
+                                headers=self._h(REFERER_ACT, xhr=True))
+        except Exception as ex:
+            log(f"getJsToken 请求失败: {type(ex).__name__}", "WARN")
+            return ""
+        raw = (r.get("data") or {}).get("jsToken") or ""
+        if not raw:
+            log("getJsToken 返回空 (百度未签发 jsToken)", "WARN")
+            return ""
         # 形如 function%20fn%28a%29...fn%28%22TOKEN%22%29 -> 提取 TOKEN
-        m = re.search(r'fn%28%22([0-9A-F]+)%22%29', raw) or re.search(r'fn\("([0-9A-F]+)"\)', urllib.parse.unquote(raw))
+        m = re.search(r'fn%28%22([0-9A-Fa-f]+)%22%29', raw) or \
+            re.search(r'fn\("([0-9A-Fa-f]+)"\)', urllib.parse.unquote(raw))
         return m.group(1) if m else ""
+
+    def _cookie_string(self):
+        """本单 Cookie 字符串 (name=value; name=value)
+        供 htj_bridge 注入 document.cookie —— dfxaf3 需要从中读
+        BDUSS / STOKEN / BAIDUID 才能把账号信息编进 jt。"""
+        try:
+            jar = getattr(self.c, "jar", None)
+            if jar is None:
+                return ""
+            out = []
+            for ck in jar:
+                out.append(f"{ck.name}={ck.value}")
+            return "; ".join(out)
+        except Exception:
+            return ""
 
     def gen_jt(self, href=REFERER_ACT):
         """生成领奖 jt: 由百度 sofire 实时签发 (Node 桥接跑官方 dfxaf3 SDK)
@@ -1271,6 +1332,10 @@ class KukuBot:
         env = dict(os.environ)
         env["HTJ_PROXY"] = getattr(self.c, "proxy", "") or ""
         env["HTJ_PROFILE"] = json.dumps(self._profile or {})
+        # ★ 账号 Cookie: dfxaf3 在浏览器里靠 document.cookie 拿 BDUSS/STOKEN
+        #   编进 jt。Node 里没有页面, 必须显式喂进去, 否则 jt 里没有账号标识,
+        #   claimreward 校验失败 → errno=8001 (HTJ_ERROR)。
+        env["HTJ_COOKIE"] = self._cookie_string()
         try:
             out = subprocess.run(["node", bridge], capture_output=True, text=True,
                                  timeout=40, env=env)
@@ -1283,6 +1348,9 @@ class KukuBot:
             d = {}
         if not (d.get("ok") and d.get("jt")):
             raise RuntimeError(f"反作弊凭证获取失败 (不发起领奖): {d or line[:200]}")
+        # ★ 同时缓存 xaf.getData().Token —— 即前端的 window.jsToken
+        #   (AntiRequest antiParams 的组成部分, 之前完全缺失 → 8002/8001)
+        self._jt_token = d.get("token") or ""
         return d["jt"]
 
     def claim_reward(self, day):
@@ -1313,8 +1381,13 @@ class KukuBot:
         params = {"tid": TID_SIGN, "day": day, "hjs": "1", "aid": AID_ACTIVITY,
                   "ev": "reward", "jt": jt, "js_env": "h5", "app": "universe",
                   "clienttype": COMMON_QS["clienttype"]}
-        if js_token:
-            params["jsToken"] = js_token
+        # ★ antiParams 组成 (前端 AntiRequest.getAntiParams 的公式):
+        #   antiParams = htjParams{aid,ev,jt} + jsToken + rands + specialParams
+        #   jsToken 优先用 xaf.getData().Token (= 前端 window.jsToken),
+        #   取不到再退回 getJsToken 接口。
+        token = self._jt_token or js_token
+        if token:
+            params["jsToken"] = token
         qs = urllib.parse.urlencode(params)
         try:
             r = self.c.post_json(f"{KUKU_HOST}/act/v2/kukuai30/claimreward?{qs}",

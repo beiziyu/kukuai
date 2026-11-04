@@ -318,8 +318,20 @@ function makeElement(tag) {
 }
 
 const localStorageData = {};
+// ★★★ 账号 Cookie 注入 (决定 jt 能不能被领奖接口认可)
+//   真实浏览器里 dfxaf3 跑在 kuku.baidu.com 页面中, 能直接读到
+//   document.cookie 里的 BDUSS / STOKEN, 并把它们编进 jt。
+//   Node 环境没有页面, document.cookie 原本是空串 → 生成的 jt 里
+//   没有任何账号标识 → 领奖接口 claimreward 校验时返回
+//   errno=8001 (HTJ_ERROR)。
+//   所以 Python 侧把【本单的 CK】通过 HTJ_COOKIE 环境变量传进来。
+const ACCOUNT_COOKIE = (function () {
+    try { return process.env.HTJ_COOKIE || ''; } catch (e) { return ''; }
+})();
+
 const documentShim = {
-    cookie: '',
+    // ★ 账号 cookie (BDUSS/STOKEN/BAIDUID...) —— 供 dfxaf3 采集进 jt
+    cookie: ACCOUNT_COOKIE,
     title: '库库AI',
     referrer: 'https://kuku.baidu.com/app',
     documentElement: makeElement('html'),
@@ -591,19 +603,38 @@ const timeout = setTimeout(() => {
     process.exit(1);
 }, (WAIT_SECONDS + 30) * 1000);
 
+// ★ urlMap: 与前端 AntiRequest.setGlobalHtjConfig 传入的完全一致。
+//   作用: 告诉 dfxaf3 "哪些业务接口需要凭证, 各自叫什么(ev)"。
+//   缺了它 → 生成的 jt 不带 ev → 百度校验 ev 对不上 → claimreward 返回
+//   errno=8001 (HTJ_ERROR)。逆向来源: 活动页 chunk-common 模块 61464。
+const URL_MAP = {
+    '/act/v2/kukuai30/signin': 'sign',
+    '/act/v2/kukuai30/claimreward': 'reward',
+    '/act/v2/component/lottery/lotterycommit': 'lottery',
+};
+
 try {
-    xaf.init({ aid: AID, dataApp: DATA_APP });
+    xaf.init({ aid: AID, dataApp: DATA_APP, urlMap: URL_MAP });
 } catch (e) { /* 部分 SDK init 异常可忽略 */ }
 
 function doReport(retries) {
     try {
         xaf.report({
             aid: AID,
+            // ★ ev: 领奖凭证的业务事件名, 必须与 urlMap['/act/v2/kukuai30/claimreward'] 一致
+            ev: 'reward',
             c: undefined,
             complete(t) {
                 clearTimeout(timeout);
                 if (t && t.code === 0 && t.jt) {
-                    console.log(JSON.stringify({ ok: true, jt: t.jt, waited: WAIT_SECONDS }));
+                    // ★ 同时取 xaf.getData().Token —— 这就是前端的 window.jsToken
+                    //   (AntiRequest 的 antiParams 组成之一, 之前一直缺失)
+                    let token = '';
+                    try {
+                        const gd = windowShim.xaf.getData();
+                        token = (gd && gd.Token) || '';
+                    } catch (e) { /* 取不到不影响 jt */ }
+                    console.log(JSON.stringify({ ok: true, jt: t.jt, token: token, waited: WAIT_SECONDS }));
                     process.exit(0);
                 } else {
                     console.error(JSON.stringify({ ok: false, stage: 'report', result: t }));
