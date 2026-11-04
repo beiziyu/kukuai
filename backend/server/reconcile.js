@@ -16,6 +16,24 @@ const db = require('./db');
 const CLAIM_API = process.env.CLAIM_API_URL || 'http://127.0.0.1:8888';
 // claim-api 里查不到任务（unknown）超过这个时长就判失败（秒）
 const STALE_SECONDS = 15 * 60;
+// 失败次数上限（与 client.js 保持一致）：达到后锁卡，引导客户走退款
+const MAX_FAIL = 2;
+
+// 失败 +1；达到上限锁卡（与 client.js 的 bumpFailCount 同逻辑）
+function bumpFailCount(cardId) {
+  try {
+    db.prepare("UPDATE cards SET fail_count = COALESCE(fail_count,0) + 1 WHERE id=?").run(cardId);
+    const row = db.prepare("SELECT fail_count FROM cards WHERE id=?").get(cardId);
+    const fc = Number(row && row.fail_count) || 0;
+    if (fc >= MAX_FAIL) {
+      db.prepare("UPDATE cards SET status=1, used_at=CURRENT_TIMESTAMP WHERE id=? AND status=0")
+        .run(cardId);
+      console.log(`[reconcile] fail_count=${fc} >= ${MAX_FAIL}, 卡密锁定 (card_id=${cardId})`);
+    }
+  } catch (e) {
+    console.error('[reconcile] bumpFailCount 失败:', e.message);
+  }
+}
 
 async function syncOnce() {
   let rows;
@@ -67,6 +85,10 @@ async function syncOnce() {
       if (upd.changes > 0 && next === 'success') {
         db.prepare("UPDATE cards SET status=1, used_at=CURRENT_TIMESTAMP WHERE id=? AND status=0")
           .run(r.card_id);
+        try { db.prepare("UPDATE cards SET fail_count=0 WHERE id=?").run(r.card_id); } catch (e) {}
+      } else if (upd.changes > 0) {
+        // ★ 判失败: 不核销卡密, 但记一次失败 (达上限锁卡)
+        bumpFailCount(r.card_id);
       }
     } catch (e) {
       // 单条失败不影响其他订单
